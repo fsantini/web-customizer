@@ -14,7 +14,7 @@ declare(strict_types=1);
  * path traversal / arbitrary file disclosure. Change ALLOWED_ROOT if your
  * .scad/.stl files live elsewhere on disk.
  */
-define('ALLOWED_ROOT', realpath(__DIR__));
+define('ALLOWED_ROOT', realpath(__DIR__) . '/scad/');
 define('DEFAULT_SCAD', 'spool_custom.scad');
 
 /**

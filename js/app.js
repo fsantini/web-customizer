@@ -485,18 +485,22 @@ exportBtn.addEventListener('click', handleExport);
 exportBtn.disabled = false;
 
 // A precomputed STL (the `stl` query param on index.php) shows instantly
-// while the real in-browser render -- which always costs a few seconds even
-// once warmed up -- catches up in the background. It's shown as-is, so it
-// may briefly not match the current parameter values if it was computed for
-// different ones; the live render replaces it as soon as it's ready.
+// instead of a blank viewport, with no render triggered and no busy splash --
+// it's shown as-is, which may not exactly match the current parameter values
+// if it was computed for different ones. It just sits there as the starting
+// point until the user actually changes something.
 const precomputedStlBase64 = window.__PRECOMPUTED_STL_BASE64__;
+let showedPrecomputed = false;
 if (precomputedStlBase64) {
   try {
     updateMesh(base64ToUint8Array(precomputedStlBase64));
-    setStatus('Showing precomputed preview — rendering live preview…', false);
+    setStatus('Precomputed STL preview', false);
+    showedPrecomputed = true;
   } catch (err) {
     appendLog(`[client] Failed to load precomputed STL: ${err.message}`);
   }
 }
 
-requestPreview();
+if (!showedPrecomputed) {
+  requestPreview();
+}
