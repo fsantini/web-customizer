@@ -76,12 +76,25 @@ function humanize(name) {
   return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 }
 
+function base64ToUint8Array(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
 // ---------------------------------------------------------------------------
-// Parse the embedded model
+// Parse the model (injected server-side by index.php from the `scad` param)
 // ---------------------------------------------------------------------------
 
-const sourceEl = document.getElementById('scad-source');
-const sourceText = sourceEl.textContent.replace(/^\n/, '');
+const sourceText = window.__SCAD_SOURCE__ || '';
+if (window.__SCAD_LOAD_ERROR__) {
+  appendLog(`[server] ${window.__SCAD_LOAD_ERROR__}`);
+}
+if (window.__STL_LOAD_ERROR__) {
+  appendLog(`[server] ${window.__STL_LOAD_ERROR__}`);
+}
+
 const parsed = parseCustomizer(sourceText);
 
 const values = {};
@@ -470,4 +483,20 @@ function downloadSTL(stlBytes) {
 buildUI(requestPreview);
 exportBtn.addEventListener('click', handleExport);
 exportBtn.disabled = false;
+
+// A precomputed STL (the `stl` query param on index.php) shows instantly
+// while the real in-browser render -- which always costs a few seconds even
+// once warmed up -- catches up in the background. It's shown as-is, so it
+// may briefly not match the current parameter values if it was computed for
+// different ones; the live render replaces it as soon as it's ready.
+const precomputedStlBase64 = window.__PRECOMPUTED_STL_BASE64__;
+if (precomputedStlBase64) {
+  try {
+    updateMesh(base64ToUint8Array(precomputedStlBase64));
+    setStatus('Showing precomputed preview — rendering live preview…', false);
+  } catch (err) {
+    appendLog(`[client] Failed to load precomputed STL: ${err.message}`);
+  }
+}
+
 requestPreview();
