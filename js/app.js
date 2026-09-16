@@ -542,8 +542,9 @@ function applyFastDump(bytes) {
 // is baked into the leaf positions: the transform chains the modelGroup's
 // Z-up rotation, the camera view, and a scale/translate S that centers the
 // orbit target and matches the perspective frustum's half-height at the
-// target distance (so orbit dolly/pan translate into zoom/pan). The ortho
-// window follows the module's fitTransform convention (half=2, margin=1.05).
+// target distance (so orbit dolly/pan translate into zoom/pan). x/y and z
+// are scaled independently (see below) -- the ortho window follows the
+// module's fitTransform convention (half=2, margin=1.05).
 function renderFastView() {
   if (!fastPreview || !fastScene) return;
   const v = camera.matrixWorldInverse.elements; // world -> view (camera -z)
@@ -571,15 +572,21 @@ function renderFastView() {
   const t = controls.target;
   const tx = v[0] * t.x + v[4] * t.y + v[8] * t.z + v[12];
   const ty = v[1] * t.x + v[5] * t.y + v[9] * t.z + v[13];
+  // x/y MUST track the perspective frustum unconditionally -- it's what
+  // keeps the fast image glued to the real camera. z only needs to land
+  // inside the [NEAR, FAR] slab for the renderer's depth precision, which is
+  // an unrelated constraint: clamping x/y to it too (via a shared min-scale)
+  // used to shrink the whole model around the orbit target once zoomed in
+  // close enough for the depth range to bind first, which reads as the model
+  // floating off the build plate. Scale z independently instead.
   const sZoom = yh / Math.max(halfHWorld, 1e-9);
   const sDepth = (FAR - NEAR - 1.0) / Math.max(zmax - zmin, 1e-6);
-  const s = Math.min(sZoom, sDepth);
 
-  // S: scale by s, orbit target centered in x/y, z-range centered mid-slab
+  // S: scale x/y by sZoom (orbit target centered), z by sDepth (mid-slab)
   const S = new THREE.Matrix4().set(
-    s, 0, 0, -s * tx,
-    0, s, 0, -s * ty,
-    0, 0, s, -s * (zmin + zmax) / 2 - (NEAR + FAR) / 2,
+    sZoom, 0, 0, -sZoom * tx,
+    0, sZoom, 0, -sZoom * ty,
+    0, 0, sDepth, -sDepth * (zmin + zmax) / 2 - (NEAR + FAR) / 2,
     0, 0, 0, 1,
   );
   const full = new THREE.Matrix4().multiplyMatrices(S, camera.matrixWorldInverse)

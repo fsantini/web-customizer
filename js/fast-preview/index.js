@@ -9,7 +9,7 @@
 // GPL-2.0-or-later; part of the OpenSCAD fast-preview module. The SCS /
 // Goldfeather renderer is ported from OpenCSG (© Florian Kirsch, HPI).
 
-import { evaluateCsg } from './eval.js';
+import { evaluateCsg, visibleBounds } from './eval.js';
 import { normalizeProducts } from './normalize.js';
 import { SCSRenderer } from './scs/scs-renderer.js';
 import { fitTransform, transformPositionsMat4 } from './camera.js';
@@ -52,7 +52,7 @@ export function createFastPreview(gl, { width, height }) {
     const t1 = performance.now();
     products = normalizeProducts(ev.root, ev.leaves);
     modelLeaves = ev.leaves;
-    bounds = ev.bounds;
+    bounds = visibleBounds(modelLeaves, products);
     const t2 = performance.now();
 
     if (!bounds || modelLeaves.length === 0) {

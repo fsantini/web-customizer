@@ -1,7 +1,8 @@
 // Column-vector 4x4 affine transforms for tessellation-side geometry.
-// The .csg dump stores row-major matrices M applied in OpenSCAD's row-vector
-// convention (p' = p * M); normalize.js converts once via transpose() so all
-// downstream code uses standard column-vector math (p' = A * p).
+// The .csg dump's multmatrix() rows are already in column-vector convention
+// (p' = M * p, translation in the last column of each row -- see fromRows()
+// below), so no transpose is needed: fromRows() is a straight repack into
+// column-major storage.
 // GPL-2.0-or-later; part of the OpenSCAD fast-preview module.
 
 export function mat4() { return new Float32Array(16); }

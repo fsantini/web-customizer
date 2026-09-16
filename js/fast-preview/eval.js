@@ -161,17 +161,44 @@ export function evaluateCsg(text) {
   }
 
   walk(root, identity(), null);
-  const bounds = leaves.length
-    ? leaves.reduce((b, l) => unionBounds(b, boundsOf(l.positions)),
-      [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity])
-    : null;
   return {
     leaves,
     unsupported: [...unsupported],
-    bounds,
     nodeCount: countNodes(root),
     root,
   };
+}
+
+// Bounds of the leaves that actually contribute visible volume. Two things
+// naive union-over-all-leaves gets wrong:
+//  - a subtrahend never enlarges what it's cut from (A-B ⊆ A), so a leaf that
+//    appears ONLY as a subtrahend (e.g. an oversized cutter cube reaching
+//    well past the solid it trims) must be excluded, not unioned in;
+//  - an intersection can be tighter than any one of its operands (A∩B's
+//    z-range is the overlap of A's and B's, not the union), so intersectees
+//    within the SAME product are combined by intersecting their boxes, not
+//    unioning them, before that product's box is unioned into the result.
+// Caller passes normalizeProducts() output, computed after this leaf list.
+export function visibleBounds(leaves, products) {
+  let acc = null;
+  for (const p of products) {
+    if (p.intersectees.length === 0) continue;
+    let box = null;
+    for (const idx of p.intersectees) {
+      const b = boundsOf(leaves[idx].positions);
+      box = box ? intersectBounds(box, b) : b;
+    }
+    if (!box || box[0] > box[3] || box[1] > box[4] || box[2] > box[5]) continue; // empty overlap
+    acc = acc ? unionBounds(acc, box) : box;
+  }
+  return acc;
+}
+
+function intersectBounds(a, b) {
+  return [
+    Math.max(a[0], b[0]), Math.max(a[1], b[1]), Math.max(a[2], b[2]),
+    Math.min(a[3], b[3]), Math.min(a[4], b[4]), Math.min(a[5], b[5]),
+  ];
 }
 
 function isIdentity(m) {

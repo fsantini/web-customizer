@@ -167,8 +167,23 @@ legend {
   inset: 0;
 }
 
+/* three.js draws this canvas's backing store at clientWidth/Height *
+   devicePixelRatio for HiDPI sharpness (renderer.setPixelRatio), but
+   renderer.setSize(..., false) deliberately leaves the CSS box alone so
+   layout doesn't fight the resize loop -- without an explicit CSS size, a
+   canvas's rendered box defaults to its width/height attributes (the scaled
+   backing store) read as CSS pixels, not to its container. At
+   devicePixelRatio 1 that coincides with #viewer's true size, so it's easy
+   to miss; at any other ratio (routine on Linux/Firefox, which honors
+   fractional OS display scaling that Chromium often doesn't) the canvas
+   overflows #viewer by exactly that factor, offsetting the grid it draws
+   from the correctly `width/height: 100%`-sized #fast-canvas overlay -- a
+   fixed-in-CSS-pixels misalignment between the two that doesn't track the
+   3D camera's zoom at all. */
 #viewer canvas {
   display: block;
+  width: 100%;
+  height: 100%;
 }
 
 .viewer-overlay {
