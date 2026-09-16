@@ -185,6 +185,52 @@ legend {
   pointer-events: none;
 }
 
+/* GPU CSG fast preview: a second WebGL2 canvas layered over the three.js
+   view, shown only while the fast path has a current image. Transparent
+   where no geometry covers, and pointer-events pass through so orbit
+   controls keep working on the three.js canvas underneath. */
+#fast-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  display: none;
+}
+
+.fast-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.fast-toggle input {
+  accent-color: var(--accent);
+}
+
+.fast-toggle input:disabled {
+  cursor: not-allowed;
+}
+
+/* Shown when the fast path can't serve the current model (unsupported node
+   types, WebGL2 missing, dump/render error) -- accurate rendering is
+   unaffected, this only announces that dragging won't live-update. */
+.fast-badge {
+  font-size: 0.75rem;
+  color: #ffb35c;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.15rem 0.5rem;
+  max-width: 24rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* `display: flex` above has the same specificity as the UA stylesheet's
    `[hidden] { display: none }` and author styles win ties, so the `hidden`
    attribute would otherwise be silently ignored -- this rule restores it. */

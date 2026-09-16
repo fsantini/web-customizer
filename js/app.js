@@ -2,13 +2,15 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { STLLoader } from 'three/addons/loaders/STLLoader.js';
 import { parseCustomizer, buildSource } from './customizer-parser.js';
+import { createFastPreview } from './fast-preview/index.js';
+import { ortho, NEAR, FAR } from './fast-preview/camera.js';
 
 // Live preview always pays the full CGAL/Manifold boolean-evaluation cost (the
 // wasm build only exposes the file-export pipeline, not OpenCSG's GPU-composited
 // live view that desktop OpenSCAD's F5 preview uses), so the only real lever we
 // have is capping segment count. Kept aggressive since it directly bounds how
 // much polygon data every boolean op has to chew through.
-const PREVIEW_FN_CAP = 16;
+const PREVIEW_FN_CAP = 30;
 
 const statusEl = document.getElementById('status');
 const exportBtn = document.getElementById('export-btn');
@@ -17,6 +19,62 @@ const viewerEl = document.getElementById('viewer');
 const overlayEl = document.getElementById('viewer-overlay');
 const overlayTextEl = document.getElementById('viewer-overlay-text');
 const logOutput = document.getElementById('log-output');
+const fastToggle = document.getElementById('fast-toggle');
+const fastBadge = document.getElementById('fast-badge');
+const fastCanvas = document.getElementById('fast-canvas');
+
+// ---------------------------------------------------------------------------
+// Fast preview (GPU CSG): state + context
+// ---------------------------------------------------------------------------
+// Functions that drive this state live below (after the viewer section, which
+// they depend on); the state itself is declared up here because the animate()
+// loop starts running before those sections and must not hit a TDZ.
+//
+// The fast path is THE preview: it renders OpenSCAD's post-parse `.csg` node
+// tree (a cheap dump: no geometry evaluation) through the fast-preview
+// module's GPU CSG renderer (OpenCSG-style SCS/Goldfeather, GPL-2.0+; see
+// js/fast-preview/), so parameter changes never pay the full Manifold/CGAL
+// boolean evaluation (tens of seconds on the spool even at $fn=16). It is
+// approximate by design; the accurate mesh render runs only on "Render &
+// Export STL" (which also feeds the exported file). When the dump can't be
+// served (unsupported node types, WebGL2 missing, dump/render error) the app
+// falls back to the pre-fast-preview behavior -- a full mesh render per
+// parameter commit -- with the badge explaining why.
+const fastGl = fastCanvas.getContext('webgl2', {
+  antialias: false,
+  alpha: true,
+  premultipliedAlpha: false,
+  stencil: true,
+  preserveDrawingBuffer: true, // the canvas is not re-rendered every frame
+});
+const FAST_SUPPORTED = Boolean(fastGl);
+
+let fastPreview = null;       // module instance, created on first usable dump
+let fastScene = null;         // { bounds } of the last applied dump
+let fastCanvasOn = false;     // fast image currently displayed
+let fastDumpActive = false;   // dump request in flight
+let fastDumpQueued = false;   // another arrived while in flight (newest wins)
+let fastBroken = false;       // fast path failed: legacy renders until re-armed
+let fastViewDirty = false;    // camera moved since the last fast render
+let commitGen = 0;            // bumped per request; stale results ignored
+let lastDumpBytes = null;     // last good dump, for resize re-renders
+
+function fastEnabled() {
+  return FAST_SUPPORTED && fastToggle.checked;
+}
+
+function showFastBadge(text) {
+  if (!FAST_SUPPORTED) return;
+  fastBadge.textContent = text;
+  fastBadge.hidden = !text;
+}
+
+if (!FAST_SUPPORTED) {
+  fastToggle.disabled = true;
+  fastToggle.checked = false;
+  fastBadge.textContent = 'Fast preview needs WebGL2';
+  fastBadge.hidden = false;
+}
 
 function setStatus(text, busy) {
   statusEl.textContent = text;
@@ -131,6 +189,7 @@ function buildRangeControl(param, container, onCommit) {
       readout.textContent = range.value;
       if (isVector) values[param.name][idx] = Number(range.value);
       else values[param.name] = Number(range.value);
+      requestFastDump(); // live GPU CSG preview while dragging (no-op if disabled/fallback)
     });
     range.addEventListener('change', () => onCommit());
 
@@ -303,12 +362,30 @@ function resizeRenderer() {
 new ResizeObserver(resizeRenderer).observe(viewerEl);
 resizeRenderer();
 
+// The fast-preview canvas tracks the same element; debounce so a continuous
+// resize doesn't rebuild the module on every tick.
+let fastResizeTimer = null;
+new ResizeObserver(() => {
+  clearTimeout(fastResizeTimer);
+  fastResizeTimer = setTimeout(resizeFastPreview, 200);
+}).observe(viewerEl);
+
 function animate() {
   requestAnimationFrame(animate);
   controls.update();
   renderer.render(scene, camera);
+  if (fastViewDirty && fastCanvasOn) {
+    fastViewDirty = false;
+    renderFastView(); // keep the GPU CSG image glued to the orbit camera
+  }
 }
 animate();
+
+// Orbit/zoom/pan all land here; the actual re-render happens once per frame
+// in animate() so damping bursts don't queue redundant GPU CSG renders.
+controls.addEventListener('change', () => {
+  fastViewDirty = true;
+});
 
 function fitCameraToObject(object) {
   const box = new THREE.Box3().setFromObject(object);
@@ -343,6 +420,209 @@ function updateMesh(stlBytes) {
     fitCameraToObject(modelGroup);
     firstRenderDone = true;
   }
+  // Accurate geometry just landed: it replaces any fast-preview image. The
+  // badge survives when the fast path is broken (it explains the fallback);
+  // otherwise whatever it said is outdated.
+  setFastVisible(false);
+  if (!fastBroken) showFastBadge('');
+}
+
+// ---------------------------------------------------------------------------
+// Fast preview (GPU CSG): rendering + coalescing (state declared up top)
+// ---------------------------------------------------------------------------
+
+function fastCanvasSize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  return [
+    Math.max(1, Math.round(viewerEl.clientWidth * dpr)),
+    Math.max(1, Math.round(viewerEl.clientHeight * dpr)),
+  ];
+}
+
+function setFastVisible(on) {
+  fastCanvasOn = on;
+  fastCanvas.style.display = on ? 'block' : 'none';
+  // The mesh underneath is the LAST committed geometry -- wrong while
+  // dragging, so hide it while the fast image is up.
+  if (currentMesh) currentMesh.visible = !on;
+}
+
+// Every parameter commit funnels here: a fast dump when the fast path is
+// healthy, otherwise the legacy accurate mesh render.
+function parameterChanged() {
+  if (fastEnabled() && !fastBroken) requestFastDump();
+  else requestPreview();
+}
+
+// The fast path failed for good (unsupported geometry, render error): stick
+// to legacy accurate renders for the rest of the session -- cycling the fast
+// toggle re-tests it -- and render the current values immediately so the user
+// isn't left with nothing (or a stale image) on screen.
+function fastUnavailable(reason) {
+  fastBroken = true;
+  setFastVisible(false);
+  showFastBadge(`Fast preview unavailable (${reason}) -- accurate renders on change`);
+  appendLog(`[fast-preview] falling back: ${reason}`);
+  requestPreview();
+}
+
+// Coalesced like requestPreview: at most one dump in flight, and the newest
+// request replaces whatever was queued. Dumps run on the same serialized
+// worker as mesh renders, so a drag that starts mid-render waits it out.
+function requestFastDump() {
+  if (!fastEnabled() || fastBroken) return;
+  commitGen++; // newest dump request wins; older in-flight results are dropped
+  if (fastDumpActive) {
+    fastDumpQueued = true;
+    return;
+  }
+  fastDumpActive = true;
+  const genAtSend = commitGen;
+  send(previewSource(), 'csg')
+    .then((bytes) => {
+      // A newer commit landed since this dump was requested: a fresher render
+      // already covers it, so don't paint the stale dump over it.
+      if (genAtSend === commitGen && !fastBroken && fastEnabled()) {
+        applyFastDump(bytes);
+      }
+    })
+    .catch((err) => fastUnavailable(err.message || 'dump failed'))
+    .finally(() => {
+      fastDumpActive = false;
+      if (fastDumpQueued) {
+        fastDumpQueued = false;
+        requestFastDump();
+      }
+    });
+}
+
+function applyFastDump(bytes) {
+  lastDumpBytes = bytes;
+  try {
+    if (!fastPreview) {
+      const [w, h] = fastCanvasSize();
+      fastCanvas.width = w;
+      fastCanvas.height = h;
+      fastPreview = createFastPreview(fastGl, { width: w, height: h });
+    }
+    const result = fastPreview.update(new TextDecoder().decode(bytes));
+    // unsupported/skipped must win over empty: a tree of only-unsupported
+    // nodes (hull(), text(), …) has no leaves, but that's a fallback case,
+    // not legitimately empty geometry.
+    if (result.unsupported.length > 0 || result.skipped.length > 0) {
+      fastUnavailable(result.unsupported.length > 0
+        ? `needs ${result.unsupported.join(', ')}`
+        : 'contains geometry the GPU path cannot composite');
+      return;
+    }
+    if (result.empty) {
+      // Legitimately empty geometry at these parameters -- not a fast-path
+      // failure. Show nothing and stay in fast mode for the next commit.
+      setFastVisible(false);
+      setStatus('Ready (fast preview: empty geometry)', false);
+      return;
+    }
+    fastScene = { bounds: result.bounds };
+    showFastBadge('');
+    if (!firstRenderDone) {
+      firstRenderDone = true;
+      fitCameraToFastBounds(result.bounds);
+    }
+    setFastVisible(true);
+    renderFastView();
+    setStatus('Ready (fast preview)', false);
+  } catch (err) {
+    fastUnavailable(err.message || 'render failed');
+  }
+}
+
+// Re-render the fast scene under the current three.js camera. The module
+// consumes geometry pre-transformed into its own frame (camera looking along
+// -z, model inside a fixed depth slab [NEAR, FAR]), so the camera's rotation
+// is baked into the leaf positions: the transform chains the modelGroup's
+// Z-up rotation, the camera view, and a scale/translate S that centers the
+// orbit target and matches the perspective frustum's half-height at the
+// target distance (so orbit dolly/pan translate into zoom/pan). The ortho
+// window follows the module's fitTransform convention (half=2, margin=1.05).
+function renderFastView() {
+  if (!fastPreview || !fastScene) return;
+  const v = camera.matrixWorldInverse.elements; // world -> view (camera -z)
+  const d = camera.position.distanceTo(controls.target);
+  const halfHWorld = Math.tan((camera.fov * Math.PI) / 360) * d;
+
+  // model z-range in view space, to keep it inside the depth slab.
+  // Bounds are in MODEL space; the group carries the Z-up->Y-up rotation,
+  // so the corners must go through V o M, not V alone.
+  const vm = new THREE.Matrix4().multiplyMatrices(camera.matrixWorldInverse, modelGroup.matrixWorld).elements;
+  const [x0, y0, z0, x1, y1, z1] = fastScene.bounds;
+  let zmin = Infinity, zmax = -Infinity;
+  for (const cx of [x0, x1]) {
+    for (const cy of [y0, y1]) {
+      for (const cz of [z0, z1]) {
+        const z = vm[2] * cx + vm[6] * cy + vm[10] * cz + vm[14];
+        if (z < zmin) zmin = z;
+        if (z > zmax) zmax = z;
+      }
+    }
+  }
+
+  const xh = 2.0 * 1.05;
+  const yh = (xh * fastCanvas.height) / fastCanvas.width;
+  const t = controls.target;
+  const tx = v[0] * t.x + v[4] * t.y + v[8] * t.z + v[12];
+  const ty = v[1] * t.x + v[5] * t.y + v[9] * t.z + v[13];
+  const sZoom = yh / Math.max(halfHWorld, 1e-9);
+  const sDepth = (FAR - NEAR - 1.0) / Math.max(zmax - zmin, 1e-6);
+  const s = Math.min(sZoom, sDepth);
+
+  // S: scale by s, orbit target centered in x/y, z-range centered mid-slab
+  const S = new THREE.Matrix4().set(
+    s, 0, 0, -s * tx,
+    0, s, 0, -s * ty,
+    0, 0, s, -s * (zmin + zmax) / 2 - (NEAR + FAR) / 2,
+    0, 0, 0, 1,
+  );
+  const full = new THREE.Matrix4().multiplyMatrices(S, camera.matrixWorldInverse)
+    .multiply(modelGroup.matrixWorld);
+  fastPreview.renderTransformed(full.elements, ortho(-xh, xh, -yh, yh, NEAR, FAR));
+}
+
+// Initial camera framing from fast-preview bounds: the accurate mesh render
+// that used to position the camera no longer runs at load. Bounds are in
+// MODEL space, so the group's Z-up->Y-up rotation must be applied first.
+function fitCameraToFastBounds(b) {
+  const [x0, y0, z0, x1, y1, z1] = b;
+  const box = new THREE.Box3();
+  for (const cx of [x0, x1]) {
+    for (const cy of [y0, y1]) {
+      for (const cz of [z0, z1]) {
+        box.expandByPoint(new THREE.Vector3(cx, cy, cz).applyMatrix4(modelGroup.matrixWorld));
+      }
+    }
+  }
+  if (box.isEmpty()) return;
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z) || 1;
+  const distance = maxDim * 2;
+  camera.near = maxDim / 100;
+  camera.far = maxDim * 100;
+  camera.updateProjectionMatrix();
+  camera.position.set(center.x + distance, center.y + distance * 0.8, center.z + distance);
+  controls.target.copy(center);
+  controls.update();
+  camera.updateMatrixWorld(); // renderFastView reads matrixWorldInverse synchronously
+}
+
+function resizeFastPreview() {
+  if (!fastPreview) return;
+  const [w, h] = fastCanvasSize();
+  if (w === fastCanvas.width && h === fastCanvas.height) return;
+  fastCanvas.width = w;
+  fastCanvas.height = h;
+  fastPreview = null; // rebuilt (and re-rendered) from the last good dump
+  fastScene = null;
+  if (lastDumpBytes && fastCanvasOn) applyFastDump(lastDumpBytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -373,19 +653,25 @@ worker.onmessage = (event) => {
   const msg = event.data;
 
   if (msg.type === 'progress') {
+    const entry = pending.get(msg.id);
+    if (entry && entry.mode === 'csg') {
+      return; // dump chatter during drags: keep it out of the log and progress UI
+    }
     appendLog(`[${msg.kind}] ${msg.text}`);
     noteProgressStage(msg.text);
     return;
   }
 
   // msg.type === 'result'
-  const { id, ok, stl, error } = msg;
+  const { id, ok, stl, csg, error } = msg;
   const entry = pending.get(id);
   pending.delete(id);
   if (activeRender && activeRender.id === id) activeRender = null;
 
   if (entry) {
-    if (ok) entry.resolve(stl);
+    // csg-mode requests resolve with the dump bytes instead of STL bytes;
+    // consumers are keyed by the mode they sent.
+    if (ok) entry.resolve(csg !== undefined ? csg : stl);
     else entry.reject(new Error(error));
   }
 
@@ -401,7 +687,7 @@ function send(source, mode) {
   activeRender = { id, mode };
   return new Promise((resolve, reject) => {
     pending.set(id, { mode, resolve, reject });
-    worker.postMessage({ id, source });
+    worker.postMessage({ id, source, mode });
   });
 }
 
@@ -434,11 +720,14 @@ function runPreview(source) {
     });
 }
 
-// A new parameter commit always wants the latest values on screen, but we
-// never interrupt a render already running against the shared instance --
-// only one render can be queued behind it, and a newer commit simply
-// replaces whatever was queued (nothing piles up).
+// Legacy path (fast preview unavailable or toggled off): an accurate mesh
+// render per parameter commit. We never interrupt a render already running
+// against the shared instance -- only one render can be queued behind it,
+// and a newer commit simply replaces whatever was queued (nothing piles up).
 function requestPreview() {
+  // A commit supersedes any queued fast dump: the mesh render covers it.
+  commitGen++;
+  fastDumpQueued = false;
   const source = previewSource();
   if (activeRender) {
     queuedPreview = { source };
@@ -449,6 +738,7 @@ function requestPreview() {
 
 async function handleExport() {
   exportBtn.disabled = true;
+  commitGen++; // in-flight dumps are stale once the accurate render lands
   beginProgress('Rendering full-resolution STL for export…');
   try {
     const stl = await send(exportSource(), 'export');
@@ -480,9 +770,21 @@ function downloadSTL(stlBytes) {
 // Wire it up
 // ---------------------------------------------------------------------------
 
-buildUI(requestPreview);
+buildUI(parameterChanged);
 exportBtn.addEventListener('click', handleExport);
 exportBtn.disabled = false;
+
+fastToggle.addEventListener('change', () => {
+  fastDumpQueued = false;
+  fastBroken = false; // cycling the toggle re-tests the fast path
+  if (!fastEnabled()) {
+    setFastVisible(false);
+    showFastBadge('');
+    requestPreview(); // fast off: accurate mesh now, and legacy behavior onward
+    return;
+  }
+  requestFastDump(); // toggled on: render the current values immediately
+});
 
 // A precomputed STL (the `stl` query param on index.php) shows instantly
 // instead of a blank viewport, with no render triggered and no busy splash --
@@ -502,5 +804,5 @@ if (precomputedStlBase64) {
 }
 
 if (!showedPrecomputed) {
-  requestPreview();
+  parameterChanged(); // fast dump when possible; legacy render otherwise
 }

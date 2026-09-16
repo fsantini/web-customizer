@@ -40,7 +40,25 @@ function readOutputIfPresent(instance) {
   }
 }
 
-async function render(id, source, onProgress) {
+// Fast-preview dump mode: OpenSCAD's post-parse node tree (`-o /output.csg`)
+// with all parameters resolved, returned as UTF-8 bytes. Writing the dump
+// skips all geometry evaluation (~20 ms vs ~20 s of boolean evaluation for
+// the STL at $fn=16), which is what makes the GPU CSG preview in js/fast-
+// preview/ viable during slider drags.
+function readOutputTextIfPresent(instance) {
+  try {
+    const stat = instance.FS.stat('/output.csg');
+    if (!stat || stat.size === 0) return null;
+    const csg = instance.FS.readFile('/output.csg');
+    const copy = new Uint8Array(csg.length);
+    copy.set(csg);
+    return copy;
+  } catch {
+    return null;
+  }
+}
+
+async function render(id, source, onProgress, mode) {
   currentOnProgress = onProgress;
   if (!nextInstancePromise) warmNextInstance();
   const instancePromise = nextInstancePromise;
@@ -55,6 +73,32 @@ async function render(id, source, onProgress) {
   }
 
   instance.FS.writeFile('/input.scad', source);
+
+  // mode 'csg' (fast-preview dump): a dump-only call. The STL call below is
+  // deliberately untouched -- adding a second `-o` flag there was probed and
+  // measurably perturbs the STL bytes, which must stay identical.
+  if (mode === 'csg') {
+    let dumpError = null;
+    try {
+      const exitCode = instance.callMain(['/input.scad', '--enable=manifold', '-o', '/output.csg']);
+      if (exitCode !== 0) dumpError = new Error(`OpenSCAD exited with code ${exitCode}`);
+    } catch (err) {
+      dumpError = err;
+    }
+    // This instance is spent regardless of outcome.
+    warmNextInstance();
+    const csg = readOutputTextIfPresent(instance);
+    if (csg) return { id, ok: true, csg };
+    return {
+      id,
+      ok: false,
+      error: dumpError && dumpError.message
+        ? dumpError.message
+        : dumpError !== null
+          ? `OpenSCAD failed (${dumpError})`
+          : 'OpenSCAD produced no output file',
+    };
+  }
 
   let callMainError = null;
   try {
@@ -85,14 +129,13 @@ async function render(id, source, onProgress) {
 let queue = Promise.resolve();
 
 self.onmessage = (event) => {
-  const { id, source } = event.data;
+  const { id, source, mode } = event.data; // mode: 'stl' (default) | 'csg'
   const onProgress = (kind, text) => self.postMessage({ type: 'progress', id, kind, text });
   queue = queue.then(async () => {
-    const result = await render(id, source, onProgress);
-    if (result.ok) {
-      self.postMessage({ type: 'result', ...result }, [result.stl.buffer]);
-    } else {
-      self.postMessage({ type: 'result', ...result });
-    }
+    const result = await render(id, source, onProgress, mode);
+    const transfer = [];
+    if (result.stl) transfer.push(result.stl.buffer);
+    if (result.csg) transfer.push(result.csg.buffer);
+    self.postMessage({ type: 'result', ...result }, transfer);
   });
 };

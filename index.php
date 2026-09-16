@@ -14,7 +14,7 @@ declare(strict_types=1);
  * path traversal / arbitrary file disclosure. Change ALLOWED_ROOT if your
  * .scad/.stl files live elsewhere on disk.
  */
-define('ALLOWED_ROOT', realpath(__DIR__) . '/scad/');
+define('ALLOWED_ROOT', realpath(__DIR__) . '/scad');
 define('DEFAULT_SCAD', 'spool_custom.scad');
 
 /**
@@ -102,6 +102,11 @@ $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT;
   <header class="topbar">
     <h1>OpenSCAD Customizer</h1>
     <div class="topbar-actions">
+      <label class="fast-toggle" title="Live GPU CSG preview (OpenCSG-style, rendered by js/fast-preview/). Approximate by design ($fn capped, booleans not evaluated); the accurate mesh render runs only on Render &amp; Export STL. With fast preview off or unavailable the app falls back to a full mesh render on every parameter change.">
+        <input type="checkbox" id="fast-toggle" checked />
+        Fast preview
+      </label>
+      <span id="fast-badge" class="fast-badge" hidden></span>
       <span id="status" class="status">Loading OpenSCAD…</span>
       <button id="export-btn" disabled>Render &amp; Export STL</button>
     </div>
@@ -114,6 +119,7 @@ $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT;
 
     <main class="viewport">
       <div id="viewer"></div>
+      <canvas id="fast-canvas" width="16" height="16"></canvas>
       <div id="viewer-overlay" class="viewer-overlay" hidden>
         <span id="viewer-overlay-text">Rendering…</span>
         <div class="progress-bar" aria-hidden="true"><div class="progress-bar-fill"></div></div>
