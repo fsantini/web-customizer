@@ -4,18 +4,30 @@ declare(strict_types=1);
 /**
  * `scad` (query param): path to the OpenSCAD file to load, either relative to
  * ALLOWED_ROOT below or absolute -- as long as it resolves inside
- * ALLOWED_ROOT. Defaults to the bundled demo model.
+ * ALLOWED_ROOT. Defaults to the bundled demo model. Ignored if `url` is given.
+ *
+ * `url` (optional query param): an http(s) URL to fetch a .scad file's source
+ * from instead of a local file. Takes precedence over `scad` when present.
+ * Fetching is SSRF-guarded: only http/https, only to hosts that resolve to a
+ * public IPv4 address (private/loopback/link-local/reserved/CGNAT ranges are
+ * blocked), the resolved IP is pinned for the actual request so DNS can't be
+ * rebound between the check and the fetch, redirects are followed manually
+ * (each hop re-validated, capped at REMOTE_FETCH_MAX_REDIRECTS), and the
+ * response body is capped at REMOTE_FETCH_MAX_BYTES.
  *
  * `stl` (optional query param): path to a precomputed .stl for the same
  * model/parameters, shown immediately while the real in-browser render is
  * still warming up, instead of a blank viewport.
  *
- * Both are confined to ALLOWED_ROOT (this directory, by default) to prevent
- * path traversal / arbitrary file disclosure. Change ALLOWED_ROOT if your
- * .scad/.stl files live elsewhere on disk.
+ * `scad`/`stl` local paths are confined to ALLOWED_ROOT (this directory, by
+ * default) to prevent path traversal / arbitrary file disclosure. Change
+ * ALLOWED_ROOT if your .scad/.stl files live elsewhere on disk.
  */
 define('ALLOWED_ROOT', realpath(__DIR__) . '/scad');
 define('DEFAULT_SCAD', 'spool_custom.scad');
+define('REMOTE_FETCH_MAX_BYTES', 2 * 1024 * 1024);
+define('REMOTE_FETCH_MAX_REDIRECTS', 5);
+define('REMOTE_FETCH_TIMEOUT_SECONDS', 15);
 
 /**
  * Resolves $param to a real, readable path inside ALLOWED_ROOT with one of
@@ -49,15 +61,165 @@ function resolve_allowed_file(?string $param, array $allowedExtensions): ?string
     return $real;
 }
 
-$scadParam = $_GET['scad'] ?? DEFAULT_SCAD;
-$scadPath = resolve_allowed_file($scadParam, ['scad']);
+/**
+ * True if $ip (a dotted-quad IPv4 literal) is a public, routable address:
+ * not private/loopback/link-local/reserved (PHP's built-in filter flags),
+ * and not RFC 6598 shared/CGNAT space (100.64.0.0/10), which those flags do
+ * not cover.
+ */
+function is_public_ipv4(string $ip): bool
+{
+    if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
+        return false;
+    }
+    $long = ip2long($ip);
+    if ($long === false) {
+        return false;
+    }
+    // 100.64.0.0/10
+    if (($long & 0xFFC00000) === ip2long('100.64.0.0')) {
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Resolves $host (an IPv4 literal or hostname) to a public IPv4 address, or
+ * null if it's not one / doesn't resolve to one. Only the first public IP
+ * found among the resolved addresses is used, and that same IP is pinned via
+ * CURLOPT_RESOLVE for the actual fetch so DNS can't be rebound afterward.
+ */
+function resolve_public_ipv4(string $host): ?string
+{
+    if (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false) {
+        return is_public_ipv4($host) ? $host : null;
+    }
+    $ips = gethostbynamel($host);
+    if ($ips === false) {
+        return null;
+    }
+    foreach ($ips as $ip) {
+        if (is_public_ipv4($ip)) {
+            return $ip;
+        }
+    }
+    return null;
+}
+
+/**
+ * Fetches a .scad source from an http(s) URL, guarded against SSRF (see the
+ * `url` doc comment above). Returns [source, null] on success or
+ * [null, errorMessage] on failure. Redirects are handled manually so each hop
+ * gets the same host/IP validation as the initial request.
+ */
+function fetch_remote_scad(string $url): array
+{
+    if (!function_exists('curl_init')) {
+        return [null, 'Remote fetch requires the PHP curl extension, which is not installed.'];
+    }
+
+    $current = $url;
+    for ($hop = 0; $hop <= REMOTE_FETCH_MAX_REDIRECTS; $hop++) {
+        $parts = parse_url($current);
+        if ($parts === false || !isset($parts['scheme'], $parts['host'])) {
+            return [null, 'Invalid URL: ' . $current];
+        }
+
+        $scheme = strtolower($parts['scheme']);
+        if ($scheme !== 'http' && $scheme !== 'https') {
+            return [null, 'Only http/https URLs are allowed: ' . $current];
+        }
+
+        $host = $parts['host'];
+        $port = $parts['port'] ?? ($scheme === 'https' ? 443 : 80);
+
+        $ip = resolve_public_ipv4($host);
+        if ($ip === null) {
+            return [null, 'URL host does not resolve to a public address: ' . $host];
+        }
+
+        $body = '';
+        $bytesRead = 0;
+        $tooLarge = false;
+
+        $ch = curl_init();
+        curl_setopt_array($ch, [
+            CURLOPT_URL => $current,
+            CURLOPT_RESOLVE => ["{$host}:{$port}:{$ip}"],
+            CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+            CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+            CURLOPT_CONNECTTIMEOUT => 5,
+            CURLOPT_TIMEOUT => REMOTE_FETCH_TIMEOUT_SECONDS,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_USERAGENT => 'web-customizer-scad-fetch/1.0',
+            CURLOPT_HEADER => false,
+            CURLOPT_WRITEFUNCTION => function ($ch, $chunk) use (&$body, &$bytesRead, &$tooLarge): int {
+                $bytesRead += strlen($chunk);
+                if ($bytesRead > REMOTE_FETCH_MAX_BYTES) {
+                    $tooLarge = true;
+                    return 0; // returning less than strlen($chunk) aborts the transfer
+                }
+                $body .= $chunk;
+                return strlen($chunk);
+            },
+        ]);
+
+        $ok = curl_exec($ch);
+        $errno = curl_errno($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $redirectUrl = curl_getinfo($ch, CURLINFO_REDIRECT_URL);
+        curl_close($ch);
+
+        if ($ok === false) {
+            if ($tooLarge) {
+                return [null, 'Remote file exceeds the ' . (REMOTE_FETCH_MAX_BYTES / (1024 * 1024)) . 'MB size limit: ' . $current];
+            }
+            return [null, 'Failed to fetch URL (curl error ' . $errno . '): ' . $current];
+        }
+
+        if ($httpCode >= 300 && $httpCode < 400) {
+            if (!$redirectUrl) {
+                return [null, 'Redirect response had no Location header: ' . $current];
+            }
+            $current = $redirectUrl;
+            continue;
+        }
+
+        if ($httpCode < 200 || $httpCode >= 300) {
+            return [null, 'Remote server returned HTTP ' . $httpCode . ': ' . $current];
+        }
+
+        if (!mb_check_encoding($body, 'UTF-8')) {
+            return [null, 'Remote file is not valid UTF-8 text: ' . $current];
+        }
+
+        return [$body, null];
+    }
+
+    return [null, 'Too many redirects: ' . $url];
+}
+
+$urlParam = isset($_GET['url']) && $_GET['url'] !== '' ? (string) $_GET['url'] : null;
 
 $scadLoadError = null;
-if ($scadPath === null) {
-    $scadLoadError = 'Could not read OpenSCAD file: ' . $scadParam;
-    $scadSource = "// No model could be loaded -- see the console panel below.\ncube([10, 10, 10]);\n";
+if ($urlParam !== null) {
+    [$scadSource, $scadLoadError] = fetch_remote_scad($urlParam);
+    if ($scadLoadError !== null) {
+        $scadSource = "// No model could be loaded -- see the console panel below.\ncube([10, 10, 10]);\n";
+    }
 } else {
-    $scadSource = file_get_contents($scadPath);
+    $scadParam = $_GET['scad'] ?? DEFAULT_SCAD;
+    $scadPath = resolve_allowed_file($scadParam, ['scad']);
+
+    if ($scadPath === null) {
+        $scadLoadError = 'Could not read OpenSCAD file: ' . $scadParam;
+        $scadSource = "// No model could be loaded -- see the console panel below.\ncube([10, 10, 10]);\n";
+    } else {
+        $scadSource = file_get_contents($scadPath);
+    }
 }
 
 $stlParam = isset($_GET['stl']) ? (string) $_GET['stl'] : null;

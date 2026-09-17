@@ -138,7 +138,18 @@ export function evaluateCsg(text) {
         return;
       }
       default:
+        // Unknown node (resize(), offset(), text(), import(), …): flagged so
+        // the caller falls back to the mesh path, but still walked as a
+        // transparent union of its children -- normalize.js's productsOf()
+        // does the same for unrecognized types, and the two MUST agree on
+        // which leaf nodes exist. Stopping here without recursing left any
+        // leaf nested under the unknown node (e.g. resize()'s children)
+        // referenced by normalize.js's products but absent from `leaves`,
+        // which crashed visibleBounds()/renderTransformed() on an
+        // undefined index instead of cleanly reporting "unsupported".
         unsupported.add(node.type);
+        for (const c of node.children || []) walk(c, M, color);
+        return;
       }
   }
 
