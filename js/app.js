@@ -591,7 +591,10 @@ function renderFastView() {
   );
   const full = new THREE.Matrix4().multiplyMatrices(S, camera.matrixWorldInverse)
     .multiply(modelGroup.matrixWorld);
-  fastPreview.renderTransformed(full.elements, ortho(-xh, xh, -yh, yh, NEAR, FAR));
+  // Debug hooks for the fast-preview flicker investigation (docs/
+  // fast-preview-chromium-flicker.md) — active only with ?fastdebug=1.
+  const onProduct = window.__FAST_ONPRODUCT__ || undefined;
+  fastPreview.renderTransformed(full.elements, ortho(-xh, xh, -yh, yh, NEAR, FAR), { onProduct });
 }
 
 // Initial camera framing from fast-preview bounds: the accurate mesh render
@@ -812,4 +815,18 @@ if (precomputedStlBase64) {
 
 if (!showedPrecomputed) {
   parameterChanged(); // fast dump when possible; legacy render otherwise
+}
+
+// Debug export for the fast-preview flicker investigation (docs/
+// fast-preview-chromium-flicker.md) — active only with ?fastdebug=1.
+if (new URLSearchParams(location.search).has('fastdebug')) {
+  window.__FAST_ONPRODUCT__ = null; // assignable from the CDP harness
+  window.__DEBUG__ = {
+    camera, controls, modelGroup, renderFastView, fastGl,
+    lastDumpBytes: () => lastDumpBytes,
+    get fastPreview() { return fastPreview; },
+    get fastScene() { return fastScene; },
+    ortho, NEAR, FAR,
+    THREE: (await import('three')),
+  };
 }

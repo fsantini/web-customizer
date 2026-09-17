@@ -88,6 +88,9 @@ void main(){
 // unattached (verified by probe), so DS sampling is unusable.
 const FS_INVAL = `#version 300 es
 precision highp float;
+// samplers default to lowp in GLSL ES fragment shaders; NVIDIA GLES drivers
+// honor that (fp16), which corrupts exact depth comparisons (stripes)
+precision highp sampler2D;
 uniform sampler2D uDepthStore;
 uniform vec4 uColor;
 layout(location=0) out vec4 fragColor;
@@ -115,9 +118,24 @@ void main(){
 }`;
 
 // nearest-wins accumulate step for the iterative composite: merges one more
-// product into the running (color, depth) pair; scales to any product count
+// product into the running (color, depth) pair; scales to any product count.
+// DNF normalization legitimately produces overlapping products for the same
+// physical surface (e.g. a subtracted compound like halftorus() expands into
+// several negation factors, each unioned back with the same outer branches),
+// so many products can validly claim the exact same pixel at nearly the same
+// depth. SCS and Goldfeather compute that depth via unrelated GPU
+// algorithms, so their results agree to many digits but not bit-for-bit, and
+// "nearest wins" resolves ties per pixel. ACCUM_EPS would make near-ties
+// keep whichever product accumulated first; an epsilon here was tried
+// against the Chromium banding and had no effect (see
+// docs/fast-preview-chromium-flicker.md — the real cause was the GLSL ES
+// lowp sampler default, which fp16-quantizes R32F reads on NVIDIA drivers;
+// fixed with 'precision highp sampler2D' in every depth-sampling shader), so
+// it stays 0.0.
+const ACCUM_EPS = '0.0';
 const FS_ACCUM = `#version 300 es
 precision highp float;
+precision highp sampler2D;  // lowp default would fp16-round R32F depths
 uniform sampler2D uAccC;
 uniform sampler2D uAccD;
 uniform sampler2D uNewC;
@@ -131,7 +149,7 @@ void main(){
   vec4 nc = texelFetch(uNewC, uv, 0);
   float nd = texelFetch(uNewD, uv, 0).r;
   bool hasAcc = acc.a > 0.75, hasNew = nc.a > 0.75;
-  bool takeNew = hasNew && (!hasAcc || nd < accD);
+  bool takeNew = hasNew && (!hasAcc || nd < accD - ${ACCUM_EPS});
   fragC = takeNew ? vec4(nc.rgb, 1.0) : vec4(acc.rgb, hasAcc ? 1.0 : 0.0);
   fragD = takeNew ? nd : accD;
 }`;
@@ -144,6 +162,7 @@ void main(){
 // count/peel chain. Shading matches FS_MESH so the composite looks uniform.
 const FS_PEEL = `#version 300 es
 precision highp float;
+precision highp sampler2D;  // lowp default would fp16-round R32F depths
 in vec3 vNrm;
 uniform sampler2D uPrevZ;
 uniform vec4 uColor;
@@ -167,13 +186,25 @@ void main(){
 // Parity counter: one additive unit per face strictly behind the current peel
 // winner (uRefZ). Blended ONE/ONE into an RGBA16F channel — one leaf per
 // channel, 4 leaves per texture (see renderProductGoldfeather).
+//
+// "Strictly behind" is a bare `> refZ` comparison (CNT_EPS left at 0.0). At
+// hole-cutter rims a candidate and a near-tangent wall crossing of another
+// leaf can land within float noise of each other (observed gaps of
+// 4e-6..3e-5 window depth), so a small epsilon here was tried against the
+// Chromium banding; a full epsilon matrix showed no effect on the artifact
+// (docs/fast-preview-chromium-flicker.md — the cause was the GLSL ES lowp
+// sampler default, fp16-quantizing the R32F reads). The ~0.2% residual
+// knife-edge pixels where CPU and GPU parity
+// disagree on coincident surfaces are documented there too.
+const CNT_EPS = '0.0';
 const FS_COUNT = `#version 300 es
 precision highp float;
+precision highp sampler2D;  // lowp default would fp16-round R32F depths
 uniform sampler2D uRefZ;
 layout(location=0) out vec4 fragCount;
 void main(){
   float refZ = texelFetch(uRefZ, ivec2(gl_FragCoord.xy), 0).r;
-  if (gl_FragCoord.z <= refZ) discard;
+  if (gl_FragCoord.z <= refZ + ${CNT_EPS}) discard;
   fragCount = vec4(1.0);
 }`;
 
@@ -208,6 +239,7 @@ function gfMergeSrc({ chunk, isFirst, isLast }) {
   const cntDecls = Array.from({ length: chunk }, (_, t) => `uniform sampler2D uCnt${t};`).join('\n');
   return `#version 300 es
 precision highp float;
+precision highp sampler2D;  // lowp default would fp16-round R32F depths
 uniform sampler2D uPeelD;
 ${cntDecls}
 uniform int uBase;
@@ -241,6 +273,7 @@ ${isLast
 // final Goldfeather copy: claimed acc → product target (color + depth)
 const FS_GFCOPY = `#version 300 es
 precision highp float;
+precision highp sampler2D;  // lowp default would fp16-round R32F depths
 uniform sampler2D uSrcC;
 uniform sampler2D uSrcD;
 layout(location=0) out vec4 fragC;
@@ -250,9 +283,6 @@ void main(){
   fragC = texelFetch(uSrcC, uv, 0);
   fragD = texelFetch(uSrcD, uv, 0).r;
 }`;
-
-const _F32_0 = new Float32Array([0]);
-const _F32_1 = new Float32Array([1]);
 
 function compile(gl, type, src) {
   const s = gl.createShader(type);
@@ -869,12 +899,21 @@ export class SCSRenderer {
   // clear a single-channel R32F texture to 0 or 1 (WebGL2 has no
   // clearTexImage; route through a scratch FBO). drawbuffer 0 is
   // unambiguous: the scratch FBO has exactly one attachment.
+  //
+  // SwiftShader rejects gl.clearBufferfv on float attachments with
+  // GL_INVALID_VALUE (1281) — the clear silently does nothing (verified:
+  // FRAMEBUFFER_COMPLETE, error 1281, content unchanged; plain gl.clear
+  // works). Clear through the fixed-function path instead. colorMask goes
+  // through the tracker so its cache stays in sync.
   _clearTexR(tex, value) {
-    const gl = this.gl;
+    const gl = this.gl, st = this.st;
     if (!this._texClearFb) this._texClearFb = gl.createFramebuffer();
     gl.bindFramebuffer(gl.FRAMEBUFFER, this._texClearFb);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
-    gl.clearBufferfv(gl.COLOR, 0, value ? _F32_1 : _F32_0);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
+      gl.TEXTURE_2D, tex, 0);
+    st.colorMask(true, true, true, true);
+    gl.clearColor(value ? 1 : 0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
