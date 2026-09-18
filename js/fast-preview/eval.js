@@ -11,6 +11,7 @@ import {
   tessCircle2D, tessSquare2D, boundsOf,
 } from './tess/primitives.js';
 import { tessRotateExtrude, tessLinearExtrude } from './tess/extrude.js';
+import { convexHull3D } from './tess/hull.js';
 
 // node types the fast path understands structurally (pass-through)
 const STRUCTURAL = new Set([
@@ -21,10 +22,76 @@ const LEAF = new Set([
   'cube', 'sphere', 'cylinder', 'polyhedron', 'rotate_extrude', 'linear_extrude',
 ]);
 
+// hull()'s brute-force O(n·h) construction gets slow when most input points
+// sit on the hull surface (measured: ~2000 such points ~230ms, ~5000 ~1.4s --
+// see tess/hull.js). Past this many input points, treat as unsupported
+// rather than stall an interactive drag.
+const HULL_POINT_CAP = 3000;
+// Same idea for the scoped minkowski() case below, but budgeted over the
+// *sum* of all pairwise vertex-cross-product sizes (each pair gets its own
+// convexHull3D call): a handful of small pairs stay well under this even
+// when the node total looks large.
+const MINKOWSKI_POINT_BUDGET = 20000;
+
+// Nodes minkowski() can handle exactly (see the "scoped minkowski" note on
+// the 'minkowski' case below): pure unions of convex primitives, no
+// difference()/intersection() anywhere -- Minkowski sum distributes over
+// union exactly, but NOT over difference/intersection, so anything with a
+// cut in it must fall back to the mesh path instead of rendering wrong.
+const MINKOWSKI_SAFE_LEAF = new Set(['cube', 'sphere', 'cylinder']);
+function isPureConvexUnion(node) {
+  switch (node.type) {
+    case 'group':
+    case 'union':
+    case 'color':
+    case 'render':
+    case 'multmatrix':
+      return (node.children || []).every(isPureConvexUnion);
+    default:
+      return MINKOWSKI_SAFE_LEAF.has(node.type);
+  }
+}
+
+function positionsToPoints(positions) {
+  const pts = [];
+  for (let i = 0; i < positions.length; i += 3) pts.push([positions[i], positions[i + 1], positions[i + 2]]);
+  return pts;
+}
+
+// Triangle soups repeat every shared vertex once per adjoining triangle (a
+// cube's 8 corners show up as 36 floats' worth of positions, a cylinder's
+// ring vertices 2-3x over) -- hull()/minkowski()'s cost is driven by point
+// COUNT, so dedup before costing or hulling, not after, or the budget below
+// is checking a number 3-6x too pessimistic for no real reason.
+function dedupPoints(pts) {
+  const seen = new Set();
+  const out = [];
+  const SCALE = 1e4; // ~1e-4 absolute tolerance -- matches the Float32Array mesh precision
+  for (const p of pts) {
+    const key = `${Math.round(p[0] * SCALE)},${Math.round(p[1] * SCALE)},${Math.round(p[2] * SCALE)}`;
+    if (!seen.has(key)) { seen.add(key); out.push(p); }
+  }
+  return out;
+}
+
 export function evaluateCsg(text) {
   const root = parseCsg(text);
   const leaves = [];
   const unsupported = new Set();
+  // addLeaf() pushes to whichever sink is "current" -- normally `leaves`,
+  // but resize()/hull()/minkowski() need their children evaluated in a LOCAL
+  // frame (own bounding box / own vertices, unaffected by the ambient
+  // transform) before their own geometry can be computed, so they swap in a
+  // throwaway sink for the duration of that sub-evaluation (see evalLocal).
+  let currentSink = leaves;
+  function evalLocal(node, color) {
+    const saved = currentSink;
+    const sink = [];
+    currentSink = sink;
+    walk(node, identity(), color);
+    currentSink = saved;
+    return sink;
+  }
 
   function num(v, dflt) { return typeof v === 'number' ? v : dflt; }
   function vec(v, dflt) { return Array.isArray(v) ? v : dflt; }
@@ -65,7 +132,7 @@ export function evaluateCsg(text) {
 
   function addLeaf(node, positions, convexity, color, source) {
     if (positions.length === 0) return;
-    leaves.push({ node, positions, convexity, color, source });
+    currentSink.push({ node, positions, convexity, color, source });
   }
 
   function walk(node, M, color) {
@@ -137,8 +204,113 @@ export function evaluateCsg(text) {
           Math.max(2, num(node.named.convexity, 2)), color, 'linear_extrude');
         return;
       }
+      case 'resize': {
+        // The dump doesn't always wrap multiple children in a group() --
+        // resize(){ a(); b(); } dumps both as direct children -- so gather
+        // all of them, same as hull()/minkowski() below.
+        const localLeaves = [];
+        for (const c of node.children) localLeaves.push(...evalLocal(c, color));
+        if (localLeaves.length === 0) return; // nothing to resize -> nothing to add
+        let box = null;
+        for (const l of localLeaves) {
+          const b = boundsOf(l.positions);
+          box = box ? unionBounds(box, b) : b;
+        }
+        const oldSize = [box[3] - box[0], box[4] - box[1], box[5] - box[2]];
+        const newsize = vec(node.named.newsize, [0, 0, 0]);
+        const autoRaw = node.named.auto;
+        const auto = Array.isArray(autoRaw) ? autoRaw.map(Boolean) : [!!autoRaw, !!autoRaw, !!autoRaw];
+        // OpenSCAD: explicit axes scale to hit newsize[i] exactly; axes left
+        // at 0 with auto=true borrow the LARGEST scale factor among the
+        // explicit axes (verified empirically against real OpenSCAD -- it's
+        // max(), not the average one might guess from "preserve aspect
+        // ratio"); axes left at 0 with auto=false don't scale at all.
+        // Scaling is from the origin (0,0,0), not the bbox center -- same as
+        // `scale()` with these computed factors.
+        const scale = [1, 1, 1];
+        let maxExplicit = 0, haveExplicit = false;
+        for (let i = 0; i < 3; i++) {
+          if (newsize[i] && oldSize[i] > 1e-6) {
+            scale[i] = newsize[i] / oldSize[i];
+            if (!haveExplicit || scale[i] > maxExplicit) maxExplicit = scale[i];
+            haveExplicit = true;
+          }
+        }
+        const autoScale = haveExplicit ? maxExplicit : 1;
+        for (let i = 0; i < 3; i++) {
+          if ((!newsize[i] || oldSize[i] <= 1e-6) && auto[i]) scale[i] = autoScale;
+        }
+        for (const l of localLeaves) {
+          const scaled = new Float32Array(l.positions.length);
+          for (let i = 0; i < l.positions.length; i += 3) {
+            scaled[i] = l.positions[i] * scale[0];
+            scaled[i + 1] = l.positions[i + 1] * scale[1];
+            scaled[i + 2] = l.positions[i + 2] * scale[2];
+          }
+          addLeaf(l.node, transform(M, scaled), l.convexity, l.color, l.source);
+        }
+        return;
+      }
+      case 'hull': {
+        const localLeaves = [];
+        for (const c of node.children) localLeaves.push(...evalLocal(c, color));
+        if (localLeaves.length === 0) return;
+        const rawPts = [];
+        for (const l of localLeaves) rawPts.push(...positionsToPoints(l.positions));
+        const pts = dedupPoints(rawPts);
+        if (pts.length > HULL_POINT_CAP) { unsupported.add('hull'); return; }
+        const mesh = convexHull3D(pts);
+        if (!mesh) return; // coplanar/degenerate -> legitimately no volume
+        addLeaf(node, transform(M, mesh), 1, color, 'hull');
+        return;
+      }
+      case 'minkowski': {
+        const children = node.children;
+        if (children.length === 2 && isPureConvexUnion(children[0]) && isPureConvexUnion(children[1])) {
+          const aLeaves = evalLocal(children[0], color);
+          const bLeaves = evalLocal(children[1], color);
+          if (aLeaves.length === 0 || bLeaves.length === 0) return; // sum with nothing is nothing
+          const aPtsList = aLeaves.map((l) => dedupPoints(positionsToPoints(l.positions)));
+          const bPtsList = bLeaves.map((l) => dedupPoints(positionsToPoints(l.positions)));
+          let cost = 0;
+          for (const a of aPtsList) for (const b of bPtsList) cost += a.length * b.length;
+          if (cost <= MINKOWSKI_POINT_BUDGET) {
+            // Minkowski sum of convex sets = convex hull of pairwise vertex
+            // sums, and it distributes over union -- see isPureConvexUnion's
+            // comment for why this is exact only when neither operand has a
+            // cut in it, and MINKOWSKI_POINT_BUDGET above for the cost bound.
+            const pieceNodes = [];
+            for (const aPts of aPtsList) {
+              for (const bPts of bPtsList) {
+                const sumPts = [];
+                for (const pa of aPts) for (const pb of bPts) {
+                  sumPts.push([pa[0] + pb[0], pa[1] + pb[1], pa[2] + pb[2]]);
+                }
+                const mesh = convexHull3D(sumPts);
+                if (!mesh) continue;
+                const pieceNode = { type: 'hull' }; // tagged so normalize.js's isConvexLeaf treats it like hull()'s own output
+                addLeaf(pieceNode, transform(M, mesh), 1, color, 'minkowski');
+                pieceNodes.push(pieceNode);
+              }
+            }
+            // Read by normalize.js's productsOf(): a minkowski node maps to
+            // several leaves (one per pair), not the usual one-node-one-leaf
+            // relationship, so it can't just be added to LEAF_TYPES.
+            node._mkLeaves = pieceNodes;
+            return;
+          }
+        }
+        // Unscoped (a cut somewhere in either operand) or over budget:
+        // flagged unsupported so the caller falls back to the mesh path, but
+        // still walked as a transparent union of the RAW operands so leaf
+        // indices stay consistent with normalize.js's fallback for this node
+        // (see the default case below for why that matters).
+        unsupported.add('minkowski');
+        for (const c of children) walk(c, M, color);
+        return;
+      }
       default:
-        // Unknown node (resize(), offset(), text(), import(), …): flagged so
+        // Unknown node (offset(), text(), import(), …): flagged so
         // the caller falls back to the mesh path, but still walked as a
         // transparent union of its children -- normalize.js's productsOf()
         // does the same for unrecognized types, and the two MUST agree on

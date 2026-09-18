@@ -24,6 +24,7 @@
 
 const LEAF_TYPES = new Set([
   'cube', 'sphere', 'cylinder', 'polyhedron', 'rotate_extrude', 'linear_extrude',
+  'hull', // hull()'s own output node, and eval.js's per-pair minkowski() pieces (tagged the same way)
 ]);
 const PASS_THROUGH = new Set(['group', 'color', 'render', 'multmatrix']);
 
@@ -83,12 +84,22 @@ function productsOf(node) {
       }
       return acc;
     }
-    default:
+    case 'minkowski':
+      // Scoped case (eval.js set node._mkLeaves): the node's real output is
+      // several convex hull pieces, one per pairwise vertex sum -- not the
+      // usual one-node-one-leaf shape, so it can't go through isLeafNode().
+      // Unscoped: falls through to the same "transparent union of children"
+      // treatment as any other unrecognized node (eval.js's fallback walk
+      // recurses into the same raw operands for this case).
+      if (node._mkLeaves) return node._mkLeaves.map((n) => ({ I: [n], S: [] }));
+    // eslint-disable-next-line no-fallthrough
+    default: {
       if (isLeafNode(node)) return [{ I: [node], S: [] }];
       // unknown structural node: union of children (eval.js flags the type)
       const out = [];
       for (const c of node.children || []) out.push(...productsOf(c));
       return out;
+    }
   }
 }
 
@@ -116,6 +127,7 @@ export function normalizeProducts(root, leaves) {
   function isConvexLeaf(node) {
     const t = node.type;
     if (t === 'cube' || t === 'sphere' || t === 'cylinder') return true;
+    if (t === 'hull') return true; // hull()'s output, and minkowski()'s per-pair pieces, are convex by construction
     if (t === 'polyhedron') return (node.named.convexity ?? 1) <= 1;
     if (t === 'linear_extrude') {
       return !node.named.twist && (node.named.convexity ?? 1) <= 1;
@@ -126,14 +138,17 @@ export function normalizeProducts(root, leaves) {
   const products = [];
   for (const prod of productsOf(root)) {
     if (prod.I.length === 0) continue; // empty child (e.g. empty group)
+    const I = prod.I.map((n) => leafIndexOf.get(n));
+    const S = prod.S.map((n) => leafIndexOf.get(n));
+    // A leaf-type node that produced no geometry (degenerate/empty profile,
+    // hull() over the point budget, …) has no entry in leafIndexOf -- the
+    // product it appears in contributes nothing, not an undefined index for
+    // visibleBounds()/renderTransformed() to crash on downstream.
+    if (I.includes(undefined) || S.includes(undefined)) continue;
     const allConvex = prod.I.every(isConvexLeaf) && prod.S.every(isConvexLeaf);
     const cls = prod.I.length === 1 && prod.S.length === 0 ? 'plain'
       : allConvex ? 'convex' : 'goldfeather';
-    products.push({
-      intersectees: prod.I.map((n) => leafIndexOf.get(n)),
-      subtrahends: prod.S.map((n) => leafIndexOf.get(n)),
-      cls,
-    });
+    products.push({ intersectees: I, subtrahends: S, cls });
   }
   return products;
 }
