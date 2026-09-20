@@ -69,6 +69,68 @@ html, body {
   cursor: not-allowed;
 }
 
+#about-btn {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.55rem 0.9rem;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+#about-btn:hover {
+  border-color: var(--text-dim);
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+/* Same [hidden]-vs-flex specificity tie as .viewer-overlay above. */
+.modal-overlay[hidden] {
+  display: none;
+}
+
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.5rem;
+  max-width: 26rem;
+  line-height: 1.5;
+}
+
+.modal h2 {
+  margin-top: 0;
+}
+
+.modal a {
+  color: var(--accent);
+}
+
+.modal-disclaimer {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
+.modal #about-modal-close {
+  margin-top: 0.5rem;
+  background: var(--accent);
+  color: #1c1e22;
+  border: none;
+  border-radius: 6px;
+  padding: 0.5rem 1rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
 .layout {
   display: flex;
   height: calc(100vh - 3rem - 6.5rem);

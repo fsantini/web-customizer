@@ -22,6 +22,9 @@ const logOutput = document.getElementById('log-output');
 const fastToggle = document.getElementById('fast-toggle');
 const fastBadge = document.getElementById('fast-badge');
 const fastCanvas = document.getElementById('fast-canvas');
+const aboutBtn = document.getElementById('about-btn');
+const aboutModal = document.getElementById('about-modal');
+const aboutModalClose = document.getElementById('about-modal-close');
 
 // ---------------------------------------------------------------------------
 // Fast preview (GPU CSG): state + context
@@ -783,6 +786,19 @@ function downloadSTL(stlBytes) {
 buildUI(parameterChanged);
 exportBtn.addEventListener('click', handleExport);
 exportBtn.disabled = false;
+
+aboutBtn.addEventListener('click', () => {
+  aboutModal.hidden = false;
+});
+aboutModalClose.addEventListener('click', () => {
+  aboutModal.hidden = true;
+});
+aboutModal.addEventListener('click', (event) => {
+  if (event.target === aboutModal) aboutModal.hidden = true;
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !aboutModal.hidden) aboutModal.hidden = true;
+});
 
 fastToggle.addEventListener('change', () => {
   fastDumpQueued = false;

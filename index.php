@@ -277,8 +277,33 @@ $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT;
       <span id="fast-badge" class="fast-badge" hidden></span>
       <span id="status" class="status">Loading OpenSCAD…</span>
       <button id="export-btn" disabled>Render &amp; Export STL</button>
+      <button id="about-btn" type="button">About</button>
     </div>
   </header>
+
+  <div id="about-modal" class="modal-overlay" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="about-modal-title">
+      <h2 id="about-modal-title">About</h2>
+      <p>
+        This software is based on
+        <a href="https://openscad.org/" target="_blank" rel="noopener">OpenSCAD</a>
+        and is released under the
+        <a href="https://www.gnu.org/licenses/old-licenses/gpl-2.0.html" target="_blank" rel="noopener">GNU General Public License v2</a>.
+      </p>
+      <p>
+        Source code is available at
+        <a href="https://github.com/fsantini/web-customizer" target="_blank" rel="noopener">github.com/fsantini/web-customizer</a>.
+      </p>
+      <p class="modal-disclaimer">
+        This software is provided as-is, without warranty of any kind, express or
+        implied, including but not limited to the warranties of merchantability,
+        fitness for a particular purpose, and noninfringement. In no event shall the
+        authors be liable for any claim, damages, or other liability arising from
+        the use of this software.
+      </p>
+      <button id="about-modal-close" type="button">Close</button>
+    </div>
+  </div>
 
   <div class="layout">
     <aside id="controls" class="sidebar" aria-label="Model parameters">
