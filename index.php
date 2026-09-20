@@ -203,6 +203,12 @@ function fetch_remote_scad(string $url): array
 }
 
 $urlParam = isset($_GET['url']) && $_GET['url'] !== '' ? (string) $_GET['url'] : null;
+if ($urlParam == null) {
+    $thingParam = isset($_GET['thing']) && $_GET['thing'] !== '' ? (string) $_GET['thing'] : null;
+    if ($thingParam !== null) {
+        $urlParam = 'https://www.thingiverse.com/download:' . $thingParam;
+    }
+}
 
 $scadLoadError = null;
 if ($urlParam !== null) {
